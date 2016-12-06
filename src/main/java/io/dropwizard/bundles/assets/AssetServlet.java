@@ -1,54 +1,98 @@
 package io.dropwizard.bundles.assets;
 
 import com.google.common.base.CharMatcher;
-import com.google.common.base.Joiner;
-import com.google.common.base.Splitter;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheBuilderSpec;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.cache.Weigher;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
-import com.google.common.hash.Hashing;
 import com.google.common.io.Files;
 import com.google.common.io.Resources;
-import com.google.common.net.HttpHeaders;
-import com.google.common.net.MediaType;
-import io.dropwizard.servlets.assets.ByteRange;
 import io.dropwizard.servlets.assets.ResourceURL;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.URISyntaxException;
 import java.net.URL;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
 import java.nio.charset.Charset;
-import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
+
+import org.eclipse.jetty.http.MimeTypes;
+import org.eclipse.jetty.server.handler.ContextHandler;
+import org.eclipse.jetty.servlet.DefaultServlet;
+import org.eclipse.jetty.util.resource.PathResource;
+import org.eclipse.jetty.util.resource.Resource;
+
+import javax.servlet.ServletContext;
 import javax.servlet.ServletException;
-import javax.servlet.ServletOutputStream;
-import javax.servlet.http.HttpServlet;
+import javax.servlet.UnavailableException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import org.eclipse.jetty.http.MimeTypes;
 
 /**
- * Servlet responsible for serving assets to the caller.  This is basically completely stolen from
- * {@link io.dropwizard.servlets.assets.AssetServlet} with the exception of allowing for override
- * options.
+ * Servlet responsible for serving assets to the caller.  This was originally based off of
+ * {@link io.dropwizard.servlets.assets.AssetServlet}.
  *
  * @see io.dropwizard.servlets.assets.AssetServlet
  */
-public class AssetServlet extends HttpServlet {
+public class AssetServlet extends DefaultServlet {
   private static final long serialVersionUID = 6393345594784987908L;
-  private static final MediaType DEFAULT_MEDIA_TYPE = MediaType.HTML_UTF_8;
   private static final CharMatcher SLASHES = CharMatcher.is('/');
 
-  private final transient CacheBuilderSpec cacheSpec;
-  private final transient LoadingCache<String, Asset> cache;
-  private final transient MimeTypes mimeTypes;
+  private final CacheBuilderSpec cacheSpec;
+  private final LoadingCache<String, Resource> cache;
 
-  private Charset defaultCharset;
+  private final AssetsConfiguration configuration;
 
-  private String cacheControlHeader = null;
+  @Override
+  public void init() throws UnavailableException {
+    ServletContext servletContext = getServletContext();
+    ContextHandler contextHandler = initContextHandler(servletContext);
+
+    // TODO how do we validate this?
+    // This servlet must be initialized during startup. Otherwise we cannot invoke setInitParameter
+    // to configure the Default Servlet.
+    if (!contextHandler.isStarting()) {
+      super.init();
+      return;
+    }
+
+    MimeTypes mimeTypes = contextHandler.getMimeTypes();
+    for (Map.Entry<String, String> entry : configuration.getMimeTypes().entrySet()) {
+      mimeTypes.addMimeMapping(entry.getKey(), entry.getValue());
+    }
+    contextHandler.setMimeTypes(mimeTypes);
+
+    setInitParameter("cacheControl", configuration.getCacheControlHeader());
+    setInitParameter("acceptRanges", configuration.serveAcceptRanges() ? "t" : "f");
+    setInitParameter("etags", configuration.generateEtags() ? "t" : "f");
+    setInitParameter("gzip", configuration.serveGzip() ? "t" : "f");
+
+    boolean first = true;
+    if (!configuration.getOtherGzipFileExtensions().isEmpty()) {
+      StringBuilder strBuilder = new StringBuilder();
+      for (String str : configuration.getOtherGzipFileExtensions()) {
+        if (first) {
+          first = false;
+        } else {
+          strBuilder.append(',');
+        }
+        strBuilder.append(str);
+      }
+      setInitParameter("otherGzipFileExtensions", strBuilder.toString());
+    }
+
+    super.init();
+  }
+
+  private void setInitParameter(String name, String value) {
+    getServletContext().setInitParameter("org.eclipse.jetty.servlet.Default."+name, value);
+  }
 
   /**
    * Creates a new {@code AssetServlet} that serves static assets loaded from {@code resourceURL}
@@ -60,66 +104,23 @@ public class AssetServlet extends HttpServlet {
    * serve a file with that name in that directory. If a directory is requested and {@code
    * indexFile} is null, it will serve a 404.
    *
-   * @param resourcePathToUriPathMapping A mapping from base URL's from which assets are loaded to
-   *                                     the URI path fragment in which the requests for that asset
-   *                                     are rooted
-   * @param indexFile                    the filename to use when directories are requested, or null
-   *                                     to serve no indexes
-   * @param defaultCharset               the default character set
-   * @param spec                         the CacheBuilderSpec to use
-   * @param overrides                    the path overrides
-   * @param mimeTypes                    the mimeType overrides
+   * @param configuration The configuration.
    */
-  public AssetServlet(Iterable<Map.Entry<String, String>> resourcePathToUriPathMapping,
-                      String indexFile,
-                      Charset defaultCharset,
-                      CacheBuilderSpec spec,
-                      Iterable<Map.Entry<String, String>> overrides,
-                      Iterable<Map.Entry<String, String>> mimeTypes) {
-    this.defaultCharset = defaultCharset;
-    AssetLoader loader = new AssetLoader(resourcePathToUriPathMapping, indexFile, overrides);
+  public AssetServlet(AssetsConfiguration configuration) {
+    this.configuration = configuration;
+    AssetLoader loader = new AssetLoader(configuration.getResourcePathToUriMappings().entrySet(),
+            configuration.getIndexFile(), configuration.getOverrides().entrySet());
 
-    CacheBuilder<Object, Object> cacheBuilder = CacheBuilder.from(spec);
+    CacheBuilder<Object, Object> cacheBuilder = CacheBuilder.from(configuration.getCacheSpec());
     // Don't add the weigher if we are using maximumSize instead of maximumWeight.
-    if (spec.toParsableString().contains("maximumWeight=")) {
+    if (configuration.getCacheSpec().contains("maximumWeight=")) {
       cacheBuilder.weigher(new AssetSizeWeigher());
     }
+
+    // Let the cache spec from the configuration override the one specified in the code
+    CacheBuilderSpec spec = CacheBuilderSpec.parse(configuration.getCacheSpec());
     this.cache = cacheBuilder.build(loader);
-
     this.cacheSpec = spec;
-    this.mimeTypes = new MimeTypes();
-    this.setMimeTypes(mimeTypes);
-  }
-
-  public void setCacheControlHeader(String cacheControlHeader) {
-    this.cacheControlHeader = cacheControlHeader;
-  }
-
-  public String getCacheControlHeader() {
-    return cacheControlHeader;
-  }
-
-  /**
-   * Adds mimeType overrides.
-   *
-   * @param mimeTypes the mimeType override mapping
-   */
-  public void setMimeTypes(Iterable<Map.Entry<String, String>> mimeTypes) {
-    for (Map.Entry<String, String> mime : mimeTypes) {
-      this.mimeTypes.addMimeMapping(mime.getKey(), mime.getValue());
-    }
-  }
-
-  public MimeTypes getMimeTypes() {
-    return mimeTypes;
-  }
-
-  public void setDefaultCharset(Charset defaultCharset) {
-    this.defaultCharset = defaultCharset;
-  }
-
-  public Charset getDefaultCharset() {
-    return this.defaultCharset;
   }
 
   public CacheBuilderSpec getCacheSpec() {
@@ -127,134 +128,15 @@ public class AssetServlet extends HttpServlet {
   }
 
   @Override
-  protected void doGet(HttpServletRequest req, HttpServletResponse resp)
-          throws ServletException, IOException {
+  public Resource getResource(String pathInContext) {
     try {
-      final StringBuilder builder = new StringBuilder(req.getServletPath());
-      if (req.getPathInfo() != null) {
-        builder.append(req.getPathInfo());
-      }
-      final Asset cachedAsset = cache.getUnchecked(builder.toString());
-      if (cachedAsset == null) {
-        resp.sendError(HttpServletResponse.SC_NOT_FOUND);
-        return;
-      }
-
-      if (isCachedClientSide(req, cachedAsset)) {
-        resp.sendError(HttpServletResponse.SC_NOT_MODIFIED);
-        return;
-      }
-
-      final String rangeHeader = req.getHeader(HttpHeaders.RANGE);
-
-      final int resourceLength = cachedAsset.getResource().length;
-      ImmutableList<ByteRange> ranges = ImmutableList.of();
-
-      boolean usingRanges = false;
-      // Support for HTTP Byte Ranges
-      // http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html
-      if (rangeHeader != null) {
-
-        final String ifRange = req.getHeader(HttpHeaders.IF_RANGE);
-
-        if (ifRange == null || cachedAsset.getETag().equals(ifRange)) {
-
-          try {
-            ranges = parseRangeHeader(rangeHeader, resourceLength);
-          } catch (NumberFormatException e) {
-            resp.sendError(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
-            return;
-          }
-
-          if (ranges.isEmpty()) {
-            resp.sendError(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
-            return;
-          }
-
-          resp.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
-          usingRanges = true;
-
-          resp.addHeader(HttpHeaders.CONTENT_RANGE, "bytes "
-                  + Joiner.on(",").join(ranges) + "/" + resourceLength);
-        }
-      }
-
-      resp.setDateHeader(HttpHeaders.LAST_MODIFIED, cachedAsset.getLastModifiedTime());
-      resp.setHeader(HttpHeaders.ETAG, cachedAsset.getETag());
-
-
-      String mimeTypeOfExtension = mimeTypes.getMimeByExtension(req.getRequestURI());
-      if (mimeTypeOfExtension == null) {
-        mimeTypeOfExtension = req.getServletContext().getMimeType(req.getRequestURI());
-      }
-
-      MediaType mediaType = DEFAULT_MEDIA_TYPE;
-
-      if (mimeTypeOfExtension != null) {
-        try {
-          mediaType = MediaType.parse(mimeTypeOfExtension);
-          if (defaultCharset != null && mediaType.is(MediaType.ANY_TEXT_TYPE)) {
-            mediaType = mediaType.withCharset(defaultCharset);
-          }
-        } catch (IllegalArgumentException expected) {
-        }
-      }
-
-      if (mediaType.is(MediaType.ANY_VIDEO_TYPE)
-              || mediaType.is(MediaType.ANY_AUDIO_TYPE) || usingRanges) {
-        resp.addHeader(HttpHeaders.ACCEPT_RANGES, "bytes");
-      }
-
-      resp.setContentType(mediaType.type() + '/' + mediaType.subtype());
-
-      if (mediaType.charset().isPresent()) {
-        resp.setCharacterEncoding(mediaType.charset().get().toString());
-      }
-
-      try (ServletOutputStream output = resp.getOutputStream()) {
-        if (usingRanges) {
-          for (final ByteRange range : ranges) {
-            output.write(cachedAsset.getResource(), range.getStart(),
-                    range.getEnd() - range.getStart() + 1);
-          }
-        } else {
-          output.write(cachedAsset.getResource());
-        }
-      }
-    } catch (RuntimeException ignored) {
-      resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+      return cache.getUnchecked(pathInContext);
+    } catch (Exception e) {
+      return null;
     }
   }
 
-  private boolean isCachedClientSide(HttpServletRequest req, Asset cachedAsset) {
-    return cachedAsset.getETag().equals(req.getHeader(HttpHeaders.IF_NONE_MATCH))
-            || (req.getDateHeader(HttpHeaders.IF_MODIFIED_SINCE)
-            >= cachedAsset.getLastModifiedTime());
-  }
-
-  /**
-   * Parses a given Range header for one or more byte ranges.
-   *
-   * @param rangeHeader    Range header to parse
-   * @param resourceLength Length of the resource in bytes
-   * @return List of parsed ranges
-   */
-  private ImmutableList<ByteRange> parseRangeHeader(final String rangeHeader,
-                                                    final int resourceLength) {
-    final ImmutableList.Builder<ByteRange> builder = ImmutableList.builder();
-    if (rangeHeader.contains("=")) {
-      final String[] parts = rangeHeader.split("=");
-      if (parts.length > 1) {
-        final List<String> ranges = Splitter.on(",").trimResults().splitToList(parts[1]);
-        for (final String range : ranges) {
-          builder.add(ByteRange.parse(range, resourceLength));
-        }
-      }
-    }
-    return builder.build();
-  }
-
-  private static class AssetLoader extends CacheLoader<String, Asset> {
+  private static class AssetLoader extends CacheLoader<String, Resource> {
     private final String indexFilename;
     private final Map<String, String> resourcePathToUriMappings = Maps.newHashMap();
     private final Iterable<Map.Entry<String, String>> overrides;
@@ -280,13 +162,13 @@ public class AssetServlet extends HttpServlet {
     }
 
     @Override
-    public Asset load(String key) throws Exception {
+    public Resource load(String key) throws Exception {
       for (Map.Entry<String, String> mapping : resourcePathToUriMappings.entrySet()) {
         if (!key.startsWith(mapping.getValue())) {
           continue;
         }
 
-        Asset asset = loadOverride(key);
+        Resource asset = loadOverride(key);
         if (asset != null) {
           return asset;
         }
@@ -317,16 +199,17 @@ public class AssetServlet extends HttpServlet {
 
           // zero out the millis; the If-Modified-Since header will not have them
           lastModified = (lastModified / 1000) * 1000;
-          return new StaticAsset(Resources.toByteArray(requestedResourceUrl), lastModified);
+          return new StaticResource(requestedResourceUrl,
+                  Resources.toByteArray(requestedResourceUrl), lastModified);
         } catch (IllegalArgumentException expected) {
           // Try another Mapping.
         }
       }
 
-      return null;
+      throw new NoSuchElementException();
     }
 
-    private Asset loadOverride(String key) throws Exception {
+    private Resource loadOverride(String key) throws Exception {
       // TODO: Support prefix matches only for directories
       for (Map.Entry<String, String> override : overrides) {
         File file = null;
@@ -347,7 +230,7 @@ public class AssetServlet extends HttpServlet {
         }
 
         if (file.exists()) {
-          return new FileSystemAsset(file);
+          return new FileSystemResource(file);
         }
       }
 
@@ -355,20 +238,16 @@ public class AssetServlet extends HttpServlet {
     }
   }
 
-  private static interface Asset {
+  private interface AssetResource {
     byte[] getResource();
-
-    String getETag();
-
-    long getLastModifiedTime();
   }
 
   /**
    * Weigh an asset according to the number of bytes it contains.
    */
-  private static final class AssetSizeWeigher implements Weigher<String, Asset> {
+  private static final class AssetSizeWeigher implements Weigher<String, AssetResource> {
     @Override
-    public int weigh(String key, Asset asset) {
+    public int weigh(String key, AssetResource asset) {
       return asset.getResource().length;
     }
   }
@@ -377,13 +256,13 @@ public class AssetServlet extends HttpServlet {
    * An asset implementation backed by the file-system.  If the backing file changes on disk, then
    * this asset will automatically reload its contents from disk.
    */
-  private static class FileSystemAsset implements Asset {
+  private static class FileSystemResource extends PathResource implements AssetResource {
     private final File file;
     private byte[] bytes;
-    private String etag;
     private long lastModifiedTime;
 
-    public FileSystemAsset(File file) {
+    private FileSystemResource(File file) {
+      super(file);
       this.file = file;
       refresh();
     }
@@ -395,15 +274,19 @@ public class AssetServlet extends HttpServlet {
     }
 
     @Override
-    public String getETag() {
+    public InputStream getInputStream() throws IOException {
       maybeRefresh();
-      return etag;
+      return new ByteArrayInputStream(getResource());
     }
 
     @Override
-    public long getLastModifiedTime() {
-      maybeRefresh();
-      return (lastModifiedTime / 1000) * 1000;
+    public ReadableByteChannel getReadableByteChannel() throws IOException {
+      return Channels.newChannel(getInputStream());
+    }
+
+    @Override
+    public boolean exists() {
+      return true;
     }
 
     private synchronized void maybeRefresh() {
@@ -414,11 +297,7 @@ public class AssetServlet extends HttpServlet {
 
     private synchronized void refresh() {
       try {
-        byte[] newBytes = Files.toByteArray(file);
-        String newETag = Hashing.murmur3_128().hashBytes(newBytes).toString();
-
-        bytes = newBytes;
-        etag = '"' + newETag + '"';
+        bytes = Files.toByteArray(file);
         lastModifiedTime = file.lastModified();
       } catch (IOException e) {
         // Ignored, don't update anything
@@ -430,29 +309,40 @@ public class AssetServlet extends HttpServlet {
    * A static asset implementation.  This implementation just encapsulates the raw bytes of an
    * asset (presumably loaded from the classpath) and will never change.
    */
-  private static class StaticAsset implements Asset {
+  private static class StaticResource extends PathResource implements AssetResource {
     private final byte[] resource;
-    private final String etag;
     private final long lastModifiedTime;
 
-    private StaticAsset(byte[] resource, long lastModifiedTime) {
+    private StaticResource(URL url, byte[] resource, long lastModifiedTime)
+            throws IOException, URISyntaxException {
+      super(url);
       this.resource = resource;
-      this.etag = '"' + Hashing.murmur3_128().hashBytes(resource).toString() + '"';
       this.lastModifiedTime = lastModifiedTime;
     }
 
+    @Override
     public byte[] getResource() {
       return resource;
     }
 
-    public String getETag() {
-      return etag;
+    @Override
+    public InputStream getInputStream() throws IOException {
+      return new ByteArrayInputStream(getResource());
     }
 
-    public long getLastModifiedTime() {
+    @Override
+    public ReadableByteChannel getReadableByteChannel() throws IOException {
+      return Channels.newChannel(getInputStream());
+    }
+
+    @Override
+    public boolean exists() {
+      return true;
+    }
+
+    @Override
+    public long lastModified() {
       return lastModifiedTime;
     }
   }
-
-
 }

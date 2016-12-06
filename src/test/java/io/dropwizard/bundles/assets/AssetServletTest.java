@@ -38,20 +38,19 @@ public class AssetServletTest {
   private static final String JSON_RESOURCE_PATH = "/json";
 
   // ServletTester expects to be able to instantiate the servlet with zero arguments
-  private static Iterable<Map.Entry<String, String>> resourceMapping(String resourcePath,
-                                                                     String uriPath) {
+  private static Map<String, String> resourceMapping(String resourcePath, String uriPath) {
     return ImmutableMap.<String, String>builder()
             .put(resourcePath, uriPath)
-            .build()
-            .entrySet();
+            .build();
   }
 
   public static class DummyAssetServlet extends AssetServlet {
     private static final long serialVersionUID = -1L;
 
     public DummyAssetServlet() {
-      super(resourceMapping(RESOURCE_PATH, DUMMY_SERVLET), "index.htm", DEFAULT_CHARSET,
-              DEFAULT_CACHE_SPEC, EMPTY_OVERRIDES, EMPTY_MIMETYPES);
+      super(AssetsConfiguration.builder()
+              .indexFile("index.html")
+              .mappings(resourceMapping(RESOURCE_PATH, DUMMY_SERVLET)).build());
     }
   }
 
@@ -59,8 +58,8 @@ public class AssetServletTest {
     private static final long serialVersionUID = -1L;
 
     public NoIndexAssetServlet() {
-      super(resourceMapping(RESOURCE_PATH, DUMMY_SERVLET), null, DEFAULT_CHARSET,
-              DEFAULT_CACHE_SPEC, EMPTY_OVERRIDES, EMPTY_MIMETYPES);
+      super(AssetsConfiguration.builder()
+              .mappings(resourceMapping(RESOURCE_PATH, DUMMY_SERVLET)).build());
     }
   }
 
@@ -68,40 +67,28 @@ public class AssetServletTest {
     private static final long serialVersionUID = 1L;
 
     public RootAssetServlet() {
-      super(resourceMapping("/", ROOT_SERVLET), null, DEFAULT_CHARSET, DEFAULT_CACHE_SPEC,
-              EMPTY_OVERRIDES, EMPTY_MIMETYPES);
-    }
-  }
-
-  public static class NoCharsetAssetServlet extends AssetServlet {
-    private static final long serialVersionUID = 1L;
-
-    public NoCharsetAssetServlet() {
-      super(resourceMapping(RESOURCE_PATH, NOCHARSET_SERVLET), null, DEFAULT_CHARSET,
-              DEFAULT_CACHE_SPEC, EMPTY_OVERRIDES, EMPTY_MIMETYPES);
-      setDefaultCharset(null);
+      super(AssetsConfiguration.builder()
+              .mappings(resourceMapping("/", ROOT_SERVLET)).build());
     }
   }
 
   public static class MimeMappingsServlet extends AssetServlet {
     public MimeMappingsServlet() {
-      super(resourceMapping(RESOURCE_PATH, MIME_SERVLET), null, DEFAULT_CHARSET, DEFAULT_CACHE_SPEC,
-              EMPTY_OVERRIDES, EMPTY_MIMETYPES);
-      Map<String, String> mimeMappings = new HashMap<>();
-      mimeMappings.put("bar", "application/bar");
-      mimeMappings.put("txt", "application/foo");
-      setMimeTypes(mimeMappings.entrySet());
+      super(AssetsConfiguration.builder()
+              .mappings(resourceMapping(RESOURCE_PATH, MIME_SERVLET))
+              .mimeTypes(ImmutableMap.<String, String>builder()
+                      .put("bar", "application/bar")
+                      .put("txt", "application/foo").build()).build());
     }
   }
 
   public static class MultipleMappingsServlet extends AssetServlet {
     public MultipleMappingsServlet() {
-      super(ImmutableMap.<String, String>builder()
+      super(AssetsConfiguration.builder()
+              .mappings(ImmutableMap.<String, String>builder()
                       .put(RESOURCE_PATH, MM_ASSET_SERVLET)
                       .put(JSON_RESOURCE_PATH, MM_JSON_SERVLET)
-                      .build().entrySet(),
-              null, DEFAULT_CHARSET, DEFAULT_CACHE_SPEC, EMPTY_OVERRIDES, EMPTY_MIMETYPES
-      );
+                      .build()).build());
     }
   }
 
@@ -120,11 +107,10 @@ public class AssetServletTest {
 
   @Before
   public void setup() throws Exception {
-    servletTester.addServlet(DummyAssetServlet.class, DUMMY_SERVLET + '*');
-    servletTester.addServlet(NoIndexAssetServlet.class, NOINDEX_SERVLET + '*');
-    servletTester.addServlet(NoCharsetAssetServlet.class, NOCHARSET_SERVLET + '*');
-    servletTester.addServlet(RootAssetServlet.class, ROOT_SERVLET + '*');
-    servletTester.addServlet(MimeMappingsServlet.class, MIME_SERVLET + '*');
+    servletTester.addServlet(new ServletHolder(new DummyAssetServlet()), DUMMY_SERVLET + '*');
+    servletTester.addServlet(new ServletHolder(new NoIndexAssetServlet()), NOINDEX_SERVLET + '*');
+    servletTester.addServlet(new ServletHolder(new RootAssetServlet()), ROOT_SERVLET + '*');
+    servletTester.addServlet(new ServletHolder(new MimeMappingsServlet()), MIME_SERVLET + '*');
 
     ServletHolder servlet = new ServletHolder(new MultipleMappingsServlet());
     servletTester.addServlet(servlet, MM_ASSET_SERVLET + '*');
@@ -151,21 +137,6 @@ public class AssetServletTest {
             .isEqualTo(200);
     assertThat(response.getContent())
             .isEqualTo("HELLO THERE");
-  }
-
-  @Test
-  public void servesCharset() throws Exception {
-    response = makeRequest(DUMMY_SERVLET + "example.txt");
-    assertThat(response.getStatus())
-            .isEqualTo(200);
-    assertThat(MimeTypes.CACHE.get(response.get(HttpHeader.CONTENT_TYPE)))
-            .isEqualTo(MimeTypes.Type.TEXT_PLAIN_UTF_8);
-
-    response = makeRequest(NOCHARSET_SERVLET + "example.txt");
-    assertThat(response.getStatus())
-            .isEqualTo(200);
-    assertThat(response.get(HttpHeader.CONTENT_TYPE))
-            .isEqualTo(MimeTypes.Type.TEXT_PLAIN.toString());
   }
 
   @Test
@@ -202,7 +173,7 @@ public class AssetServletTest {
     final String secondEtag = response.get(HttpHeaders.ETAG);
 
     assertThat(firstEtag)
-            .isEqualTo("\"174a6dd7325e64c609eab14ab1d30b86\"")
+            .isEqualTo("W/\"oowv0NBwBScoowuiGOyzGQ\"")
             .isEqualTo(secondEtag);
   }
 
@@ -215,9 +186,8 @@ public class AssetServletTest {
     final String secondEtag = response.get(HttpHeaders.ETAG);
 
     assertThat(firstEtag)
-            .isEqualTo("\"174a6dd7325e64c609eab14ab1d30b86\"");
-    assertThat(secondEtag.equals("\"26ae56a90cd78c6720c544707d22110b\"") ||
-            secondEtag.equals("\"7a13c3f9f2be8379b5a2fb77a85e1d10\""));
+            .isEqualTo("W/\"oowv0NBwBScoowuiGOyzGQ\"");
+    assertThat(secondEtag.equals("W/\"LK+Z3A90ZaYLK+YhLy2rOQ\""));
   }
 
   @Test
@@ -357,7 +327,8 @@ public class AssetServletTest {
     response = makeRequest();
     final int statusWithMatchingEtag = response.getStatus();
 
-    request.setHeader(HttpHeaders.IF_RANGE, correctEtag + "FOO");
+    request.setHeader(HttpHeaders.IF_RANGE,
+            correctEtag.substring(correctEtag.length() - 3) + "FOO");
     response = makeRequest();
     final int statusWithNonMatchingEtag = response.getStatus();
 
@@ -491,13 +462,13 @@ public class AssetServletTest {
 
   @Test
   public void servesFromMultipleMappings() throws Exception {
-    response = makeRequest(MM_ASSET_SERVLET + "/example.txt");
+    response = makeRequest(MM_ASSET_SERVLET + "example.txt");
     assertThat(response.getStatus())
             .isEqualTo(200);
     assertThat(response.getContent())
             .isEqualTo("HELLO THERE");
 
-    response = makeRequest(MM_JSON_SERVLET + "/example.txt");
+    response = makeRequest(MM_JSON_SERVLET + "example.txt");
     assertThat(response.getStatus())
             .isEqualTo(200);
     assertThat(response.getContent())
@@ -506,11 +477,11 @@ public class AssetServletTest {
 
   @Test
   public void noPollutionAcrossMultipleMappings() throws Exception {
-    response = makeRequest(MM_ASSET_SERVLET + "/json%20only.txt");
+    response = makeRequest(MM_ASSET_SERVLET + "json%20only.txt");
     assertThat(response.getStatus())
             .isEqualTo(404);
 
-    response = makeRequest(MM_JSON_SERVLET + "/json%20only.txt");
+    response = makeRequest(MM_JSON_SERVLET + "json%20only.txt");
     assertThat(response.getStatus())
             .isEqualTo(200);
   }
